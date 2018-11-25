@@ -64,7 +64,6 @@ type Raft struct {
 	lastMessageTime int64//判断什么时候开始去看能不能竞选
 	electCh         chan bool
 	heartbeat       chan bool
-	heartbeatRe     chan bool
 }
 
 type LogEntry struct {
@@ -222,20 +221,22 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	return ok
 }
 
-func (rf *Raft) sendHeartBeat(server int, args AppendEntriesArgs, reply *AppendEntriesReply, timeout int) {
+func (rf *Raft) sendHeartBeat(server int, args AppendEntriesArgs, timeout int) bool {
 	c := make(chan bool, 1)
-	go func() { c <- rf.peers[server].Call("Raft.AppendEntries", args, reply) }()
+	var reply AppendEntriesReply
+	go func() { c <- rf.peers[server].Call("Raft.AppendEntries", args, &reply) }()
 	select {
 	case ok := <- c:
 		if ok && reply.Success {
-			rf.heartbeatRe <- true
+			return true
 		} else {
-			rf.heartbeatRe <- false
+			return false
 		}
 	case <-time.After(time.Duration(timeout) * time.Millisecond):
-		rf.heartbeatRe <- false
+		return false
 		break
 	}
+	return false
 }
 
 func getPresentMileTime() int64 {
@@ -259,32 +260,34 @@ func (rf *Raft) sendRequestVoteAndTrigger(server int, args RequestVoteArgs, repl
 	}
 }
 
+// 发送心跳
 func (rf *Raft) sendAppendEntriesImpl() {
 	//如果我是leader
 	if rf.State == "Leader" {
-		var args AppendEntriesArgs
 		var success_count int
+
 		timeout := 20
+		var args AppendEntriesArgs
 		args.LeaderId = rf.me
 		args.Term = rf.CurrentTerm
+		// 发送
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
-				var reply AppendEntriesReply
-				go rf.sendHeartBeat(i, args, &reply, timeout)
-			}
-		}
-		for i := 0; i < len(rf.peers)-1; i++ {
-			select {
-			case ok := <-rf.heartbeatRe:
-				if ok {
-					success_count++
-					if success_count >= len(rf.peers)/2 {
-						rf.mu.Lock()
-						rf.lastMessageTime = getPresentMileTime()
-						rf.mu.Unlock()
-					}
+				c := make(chan bool, 1)
+				go func() { c <- rf.sendHeartBeat(i, args, timeout) }()
+				select {
+					case ok := <- c:
+						if ok {
+							success_count++
+						}
 				}
 			}
+		}
+		// 如果发送成功 一半以上收到
+		if success_count >= len(rf.peers)/2 {
+			rf.mu.Lock()
+			rf.lastMessageTime = getPresentMileTime()
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -432,7 +435,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.State = "Follower"
 	rf.electCh = make(chan bool)
 	rf.heartbeat = make(chan bool)
-	rf.heartbeatRe = make(chan bool)
 
 	go rf.election()
 	go rf.sendLeaderHeartBeat()
