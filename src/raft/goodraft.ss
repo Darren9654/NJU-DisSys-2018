@@ -48,60 +48,59 @@ type Raft struct {
 
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
-	// State a Raft server must maintain.
-	State           string
-
-	CurrentTerm     int
-	VotedFor        int
-	log []LogEntry
-
-	CommitIndex int
-	LastApplied int
-
-	NextIndex []int
-	MatchIndex []int
-
-	lastMessageTime int64//判断什么时候开始去看能不能竞选
+	// state a Raft server must maintain.
+	currentTerm     int
+	votedFor        int
+	state           int // 0 is follower | 1 is candidate | 2 is leader
+	timeout         int
+	currentLeader   int
+	lastMessageTime int64
+	message         chan bool
 	electCh         chan bool
 	heartbeat       chan bool
 	heartbeatRe     chan bool
 }
 
-type LogEntry struct {
-	Command interface{}
-	Term int
-}
-
 func (rf *Raft) becomeCandidate() {
-	rf.State = "Candidate"
-	rf.CurrentTerm = rf.CurrentTerm + 1
-	rf.VotedFor = rf.me
+	rf.state = 1
+	rf.setTerm(rf.currentTerm + 1)
+	rf.votedFor = rf.me
+	rf.currentLeader = -1
 }
 
 func (rf *Raft) becomeLeader() {
-	rf.State = "Leader"
+	rf.state = 2
+	rf.currentLeader = rf.me
 }
 
 func (rf *Raft) becomeFollower(term int, candidate int) {
-	rf.State = "Follower"
-	rf.CurrentTerm = term
-	rf.VotedFor = candidate
-	rf.lastMessageTime = getPresentMileTime()
+	rf.setTerm(term)
+	rf.votedFor = candidate
+	rf.setMessageTime(milliseconds())
 }
 
-// return CurrentTerm and whether this server
+// return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+
 	var term int
 	var isLeader bool
 	// Your code here.
-	term = rf.CurrentTerm
-	isLeader = (rf.State == "Leader")
+	term = rf.currentTerm
+	isLeader = rf.currentLeader == rf.me
 	return term, isLeader
 }
 
+func (rf *Raft) setTerm(term int) {
+	rf.currentTerm = term
+}
+
+func (rf *Raft) setMessageTime(time int64) {
+	rf.lastMessageTime = time
+}
+
 //
-// save Raft's persistent State to stable storage,
+// save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
@@ -117,7 +116,7 @@ func (rf *Raft) persist() {
 }
 
 //
-// restore previously persisted State.
+// restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here.
@@ -133,6 +132,13 @@ func min(x, y int) int {
 		return x
 	}
 	return y
+}
+
+func max(x, y int) int {
+	if x < y {
+		return y
+	}
+	return x
 }
 
 //
@@ -158,10 +164,6 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
-	PrevLogIndex int
-	PrevLogTerm int
-	Entries []LogEntry
-	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -174,28 +176,39 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
-	rf.mu.Lock()
-	if args.Term <= rf.CurrentTerm {
+	currentTerm, _ := rf.GetState()
+	if args.Term < currentTerm {
+		reply.Term = currentTerm
 		reply.VoteGranted = false
-		reply.Term = rf.CurrentTerm
+		return
+	}
+
+	if rf.votedFor != -1 && args.Term <= rf.currentTerm {
+		reply.VoteGranted = false
+		rf.mu.Lock()
+		rf.setTerm(max(args.Term, currentTerm))
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 	} else {
-		rf.becomeFollower(args.Term, args.CandidateId)
+		rf.mu.Lock()
+		rf.becomeFollower(max(args.Term, currentTerm), args.CandidateId)
+		rf.mu.Unlock()
 		reply.VoteGranted = true
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
-	if args.Term < rf.CurrentTerm {
+	if args.Term < rf.currentTerm {
 		reply.Success = false
-		reply.Term = rf.CurrentTerm
+		reply.Term = rf.currentTerm
 	} else {
 		reply.Success = true
-		reply.Term = rf.CurrentTerm
+		reply.Term = rf.currentTerm
 		rf.mu.Lock()
-		rf.VotedFor = args.LeaderId
-		rf.State = "Follower"
-		rf.lastMessageTime = getPresentMileTime()
+		rf.currentLeader = args.LeaderId
+		rf.votedFor = args.LeaderId
+		rf.state = 0
+		rf.setMessageTime(milliseconds())
 		rf.mu.Unlock()
 	}
 }
@@ -226,7 +239,7 @@ func (rf *Raft) sendHeartBeat(server int, args AppendEntriesArgs, reply *AppendE
 	c := make(chan bool, 1)
 	go func() { c <- rf.peers[server].Call("Raft.AppendEntries", args, reply) }()
 	select {
-	case ok := <- c:
+	case ok := <-c:
 		if ok && reply.Success {
 			rf.heartbeatRe <- true
 		} else {
@@ -238,17 +251,20 @@ func (rf *Raft) sendHeartBeat(server int, args AppendEntriesArgs, reply *AppendE
 	}
 }
 
-func getPresentMileTime() int64 {
-	//带纳秒的时间戳
+func randomRange(min, max int64) int64 {
+	return rand.Int63n(max-min) + min
+}
+
+func milliseconds() int64 {
 	return time.Now().UnixNano() / int64(time.Millisecond)
 }
 
 func (rf *Raft) sendRequestVoteAndTrigger(server int, args RequestVoteArgs, reply *RequestVoteReply, timeout int) {
 	c := make(chan bool, 1)
-	c <- rf.sendRequestVote(server, args, reply)
+	go func() { c <- rf.sendRequestVote(server, args, reply) }()
 	select {
-	case <- c:
-		if reply.VoteGranted {
+	case ok := <-c:
+		if ok && reply.VoteGranted {
 			rf.electCh <- true
 		} else {
 			rf.electCh <- false
@@ -260,13 +276,12 @@ func (rf *Raft) sendRequestVoteAndTrigger(server int, args RequestVoteArgs, repl
 }
 
 func (rf *Raft) sendAppendEntriesImpl() {
-	//如果我是leader
-	if rf.State == "Leader" {
+	if rf.currentLeader == rf.me {
 		var args AppendEntriesArgs
 		var success_count int
 		timeout := 20
 		args.LeaderId = rf.me
-		args.Term = rf.CurrentTerm
+		args.Term = rf.currentTerm
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
 				var reply AppendEntriesReply
@@ -280,11 +295,16 @@ func (rf *Raft) sendAppendEntriesImpl() {
 					success_count++
 					if success_count >= len(rf.peers)/2 {
 						rf.mu.Lock()
-						rf.lastMessageTime = getPresentMileTime()
+						rf.setMessageTime(milliseconds())
 						rf.mu.Unlock()
 					}
 				}
 			}
+		}
+		if success_count < len(rf.peers)/2 {
+			rf.mu.Lock()
+			rf.currentLeader = -1
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -302,25 +322,26 @@ func (rf *Raft) sendLeaderHeartBeat() {
 }
 
 func (rf *Raft) election_one_round() bool {
+	// begin election
 	var timeout int64
 	var done int
 	var triggerHeartbeat bool
 	timeout = 100
-	last := getPresentMileTime()
+	last := milliseconds()
 	success := false
 	rf.mu.Lock()
 	rf.becomeCandidate()
 	rf.mu.Unlock()
 	rpcTimeout := 20
 	for {
-		// 找大家求选票
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
 				var args RequestVoteArgs
-				args.Term = rf.CurrentTerm
+				server := i
+				args.Term = rf.currentTerm
 				args.CandidateId = rf.me
 				var reply RequestVoteReply
-				go rf.sendRequestVoteAndTrigger(i, args, &reply, rpcTimeout)
+				go rf.sendRequestVoteAndTrigger(server, args, &reply, rpcTimeout)
 			}
 		}
 		done = 0
@@ -330,7 +351,8 @@ func (rf *Raft) election_one_round() bool {
 			case ok := <-rf.electCh:
 				if ok {
 					done++
-					success = (done >= len(rf.peers)/2) && (rf.VotedFor == rf.me)
+					success = done >= len(rf.peers)/2 || rf.currentLeader > -1
+					success = success && rf.votedFor == rf.me
 					if success && !triggerHeartbeat {
 						triggerHeartbeat = true
 						rf.mu.Lock()
@@ -341,8 +363,12 @@ func (rf *Raft) election_one_round() bool {
 				}
 			}
 		}
-		if (timeout+last < getPresentMileTime()) || (done >= len(rf.peers)/2) {
+		if (timeout+last < milliseconds()) || (done >= len(rf.peers)/2 || rf.currentLeader > -1) {
 			break
+		} else {
+			select {
+			case <-time.After(time.Duration(10) * time.Millisecond):
+			}
 		}
 	}
 	return success
@@ -351,19 +377,16 @@ func (rf *Raft) election_one_round() bool {
 func (rf *Raft) election() {
 	var result bool
 	for {
-		timeout := rand.Int63n(100) + 50
-		rf.lastMessageTime = getPresentMileTime()
-		for rf.lastMessageTime+timeout > getPresentMileTime() {
+		timeout := randomRange(150, 300)
+		rf.setMessageTime(milliseconds())
+		for rf.lastMessageTime+timeout > milliseconds() {
 			select {
-			// 超时了开始判定
 			case <-time.After(time.Duration(timeout) * time.Millisecond):
-			//如果没人竞选 
-				if rf.lastMessageTime+timeout <= getPresentMileTime() {
+				if rf.lastMessageTime+timeout <= milliseconds() {
 					break
 				} else {
-					//别人去竞选了 
-					rf.lastMessageTime = getPresentMileTime()
-					timeout = rand.Int63n(100) + 50
+					rf.setMessageTime(milliseconds())
+					timeout = randomRange(150, 300)
 					continue
 				}
 			}
@@ -413,8 +436,8 @@ func (rf *Raft) Kill() {
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
 // have the same order. persister is a place for this server to
-// save its persistent State, and also initially holds the most
-// recent saved State, if any. applyCh is a channel on which the
+// save its persistent state, and also initially holds the most
+// recent saved state, if any. applyCh is a channel on which the
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
@@ -425,19 +448,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
-	// Your initialization code here.
-	rf.CurrentTerm = 0
-	rf.VotedFor = -1
-	rf.State = "Follower"
+	rf.setTerm(0)
+	rf.votedFor = -1
+	rf.state = 0 // 0 is follower | 1 is candidate | 2 is leader
+	rf.timeout = 0
+	rf.currentLeader = -1
 	rf.electCh = make(chan bool)
+	rf.message = make(chan bool)
 	rf.heartbeat = make(chan bool)
 	rf.heartbeatRe = make(chan bool)
+	rand.Seed(time.Now().UnixNano())
 
+	// Your initialization code here.
 	go rf.election()
 	go rf.sendLeaderHeartBeat()
 
-	// initialize from State persisted before a crash
+	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
