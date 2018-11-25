@@ -26,6 +26,7 @@ import "time"
 // import "bytes"
 // import "encoding/gob"
 
+
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -63,7 +64,7 @@ type Raft struct {
 	MatchIndex []int
 
 	lastMessageTime int64//判断什么时候开始去看能不能竞选
-	startHeatBeat       chan bool
+	startHeatBeat       chan bool//是否开始发送心跳
 }
 
 type LogEntry struct {
@@ -221,10 +222,9 @@ func getPresentMileTime() int64 {
 
 // 心跳部分
 func (rf *Raft) sendHeartBeat() int {
+	timeout := 20
 	var success_count int
 	success_count = 0
-
-	timeout := 20
 	// 发送
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
@@ -234,18 +234,17 @@ func (rf *Raft) sendHeartBeat() int {
 			var args AppendEntriesArgs
 			args.LeaderId = rf.me
 			args.Term = rf.CurrentTerm
-
 			go func() { c <- rf.peers[i].Call("Raft.AppendEntries", args, &reply) }()
 			select {
-				case ok := <- c:
-					if ok && reply.Success {
-						success_count++
-					}
-				case <-time.After(time.Duration(timeout) * time.Millisecond):
-					break
+			case ok := <- c:
+				if ok && reply.Success {
+					success_count++
 				}
+			case <-time.After(time.Duration(timeout) * time.Millisecond):
+				continue
 			}
 		}
+	}
 	return success_count
 }
 
@@ -257,13 +256,13 @@ func (rf *Raft) sendAppendEntriesImpl() {
 		c := make(chan int, 1)
 		go func() { c <- rf.sendHeartBeat() }()
 		select {
-			case ok := <- c:
+		case count := <- c:
 				// 如果发送成功 一半以上收到
-				if ok >= len(rf.peers)/2 {
-					rf.mu.Lock()
-					rf.lastMessageTime = getPresentMileTime()
-					rf.mu.Unlock()
-				}
+			if count >= len(rf.peers)/2 {
+				rf.mu.Lock()
+				rf.lastMessageTime = getPresentMileTime()
+				rf.mu.Unlock()
+			}
 		}
 	}
 }
@@ -282,7 +281,7 @@ func (rf *Raft) sendLeaderHeartBeat() {
 // 心跳部分
 
 // 选举部分
-func (rf *Raft) sendRequestVoteAndTrigger() int {
+func (rf *Raft) sendRequestVoteAndCount() int {
 	timeout := 20
 	var done int
 	done = 0
@@ -295,14 +294,13 @@ func (rf *Raft) sendRequestVoteAndTrigger() int {
 
 			c := make(chan bool, 1)
 			go func(){c <- rf.sendRequestVote(i, args, &reply)}()
-
 			select {
-				case <- c:
-					if reply.VoteGranted {
-						done++
-					}
-				case <-time.After(time.Duration(timeout) * time.Millisecond):
-					break
+			case <- c:
+				if reply.VoteGranted {
+					done++
+				}
+			case <-time.After(time.Duration(timeout) * time.Millisecond):
+				continue
 			}
 		}
 	}
@@ -317,22 +315,22 @@ func (rf *Raft) election_one_round() bool {
 	rf.mu.Lock()
 	rf.becomeCandidate()
 	rf.mu.Unlock()
-	var done int
+	done := 0
 	for {
 		// 找大家求选票
 		c := make(chan int, 1)
-		go func() { c <- rf.sendRequestVoteAndTrigger() }()
+		go func() { c <- rf.sendRequestVoteAndCount() }()
 		select {
-			case ok := <- c:
+		case ok := <- c:
 				// 如果发送成功 一半以上收到
-				done = ok
-				success = (done >= len(rf.peers)/2) && (rf.VotedFor == rf.me)
-				if success {
-					rf.mu.Lock()
-					rf.becomeLeader()
-					rf.mu.Unlock()
-					rf.startHeatBeat <- true
-				}
+			done = ok
+			success = (done >= len(rf.peers)/2) && (rf.VotedFor == rf.me)
+			if success {
+				rf.mu.Lock()
+				rf.becomeLeader()
+				rf.mu.Unlock()
+				rf.startHeatBeat <- true
+			}
 		}
 		if (timeout+last < getPresentMileTime()) || (done >= len(rf.peers)/2) {
 			return success
@@ -361,7 +359,7 @@ func (rf *Raft) election() {
 			}
 		}
 
-		// election till success
+		// 竞选到成功
 		result = false
 		for !result {
 			result = rf.election_one_round()
@@ -430,6 +428,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from State persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
 
 	return rf
 }
